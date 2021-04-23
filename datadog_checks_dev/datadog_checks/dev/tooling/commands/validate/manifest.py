@@ -10,13 +10,15 @@ from datadog_checks.dev.tooling.manifest_validator.validator import get_all_vali
 
 from ....fs import file_exists, read_file, write_file
 from ...constants import get_root
+from ...testing import process_checks_option
 from ..console import CONTEXT_SETTINGS, abort, echo_failure, echo_info, echo_success, echo_warning
 
 
 @click.command(context_settings=CONTEXT_SETTINGS, short_help='Validate `manifest.json` files')
+@click.argument('check', autocompletion=complete_valid_checks, required=False)
 @click.option('--fix', is_flag=True, help='Attempt to fix errors')
 @click.pass_context
-def manifest(ctx, fix):
+def manifest(ctx, check, fix):
     """Validate `manifest.json` files."""
     root = get_root()
     is_extras = ctx.obj['repo_choice'] == 'extras'
@@ -27,8 +29,10 @@ def manifest(ctx, fix):
     message_methods = {'success': echo_success, 'warning': echo_warning, 'failure': echo_failure, 'info': echo_info}
     all_validators = get_all_validators(is_extras, is_marketplace)
 
-    echo_info("Validating all manifest.json files...")
-    for check_name in sorted(os.listdir(root)):
+    checks = process_checks_option(check, source='integrations')
+    echo_info(f"Validating manifest.json files for {len(checks)} checks ...")
+
+    for check_name in checks:
         manifest_file = os.path.join(root, check_name, 'manifest.json')
 
         if file_exists(manifest_file):
