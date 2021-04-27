@@ -11,6 +11,7 @@ from datadog_checks.dev.tooling.manifest_validator.validator import get_all_vali
 from ....fs import file_exists, read_file, write_file
 from ...constants import get_root
 from ...testing import process_checks_option
+from ...utils import complete_valid_checks
 from ..console import CONTEXT_SETTINGS, abort, echo_failure, echo_info, echo_success, echo_warning
 
 
