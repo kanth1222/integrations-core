@@ -1,3 +1,4 @@
+import itertools
 import logging
 import os
 import re
@@ -42,8 +43,7 @@ PG_STAT_ACTIVITY_QUERY = re.sub(
     ' ',
     """
     SELECT * FROM {pg_stat_activity_view}
-    WHERE datname = %s
-    AND coalesce(TRIM(query), '') != ''
+    WHERE coalesce(TRIM(query), '') != ''
     AND query_start IS NOT NULL
 """,
 ).strip()
@@ -58,7 +58,8 @@ class PostgresStatementSamples(object):
 
     def __init__(self, check, config):
         self._check = check
-        self._db = None
+        # map[dbname -> psycopg connection]
+        self._db_pool = {}
         self._config = config
         self._log = get_check_logger()
         self._activity_last_query_start = None
@@ -108,7 +109,7 @@ class PostgresStatementSamples(object):
         self._tags_str = ','.join(self._tags)
         for t in self._tags:
             if t.startswith('service:'):
-                self._service = t[len('service:') :]
+                self._service = t[len('service:'):]
         self._last_check_run = time.time()
         if self._run_sync or is_affirmative(os.environ.get('DBM_STATEMENT_SAMPLER_RUN_SYNC', "false")):
             self._log.debug("Running statement sampler synchronously")
@@ -121,11 +122,14 @@ class PostgresStatementSamples(object):
     def _get_new_pg_stat_activity(self):
         start_time = time.time()
         query = PG_STAT_ACTIVITY_QUERY.format(pg_stat_activity_view=self._config.pg_stat_activity_view)
-        with self._get_db().cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            params = (self._config.dbname,)
-            if self._activity_last_query_start:
-                query = query + " AND query_start > %s"
-                params = params + (self._activity_last_query_start,)
+        params = ()
+        if self._config.dbstrict:
+            query = query + " AND datname = %s"
+            params = params + (self._config.dbname,)
+        if self._activity_last_query_start:
+            query = query + " AND query_start > %s"
+            params = params + (self._activity_last_query_start,)
+        with self._get_db(self._config.dbname).cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             self._log.debug("Running query [%s] %s", query, params)
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -162,19 +166,21 @@ class PostgresStatementSamples(object):
                 tags=self._tags + ["error:insufficient-privilege"],
             )
 
-    def _get_db(self):
+    def _get_db(self, dbname):
         # while psycopg2 is threadsafe (meaning in theory we should be able to use the same connection as the parent
         # check), the parent doesn't use autocommit and instead calls commit() and rollback() explicitly, meaning
         # it can cause strange clashing issues if we're trying to use the same connection from another thread here.
         # since the statement sampler runs continuously it's best we have our own connection here with autocommit
         # enabled
-        if not self._db or self._db.closed:
-            self._db = self._check._new_connection()
-            self._db.set_session(autocommit=True)
-        if self._db.status != psycopg2.extensions.STATUS_READY:
+        db = self._db_pool.get(dbname)
+        if not db or db.closed:
+            db = self._check._new_connection(self._config.dbname)
+            db.set_session(autocommit=True)
+            self._db_pool[dbname] = db
+        if db.status != psycopg2.extensions.STATUS_READY:
             # Some transaction went wrong and the connection is in an unhealthy state. Let's fix that
-            self._db.rollback()
-        return self._db
+            db.rollback()
+        return db
 
     def _collection_loop(self):
         try:
@@ -207,15 +213,16 @@ class PostgresStatementSamples(object):
             )
         finally:
             self._log.info("Shutting down statement sampler collection loop")
-            self._close_db_conn()
+            self._close_db_pool()
 
-    def _close_db_conn(self):
-        if self._db and not self._db.closed:
-            try:
-                self._db.close()
-            except Exception:
-                self._log.exception("failed to close DB connection")
-        self._db = None
+    def _close_db_pool(self):
+        for dbname, db in self._db_pool.items():
+            if db and not db.closed:
+                try:
+                    db.close()
+                except Exception:
+                    self._log.exception("failed to close DB connection for db=%s", dbname)
+            self._db_pool[dbname] = None
 
     def _collect_statement_samples(self):
         self._rate_limiter.sleep()
@@ -252,10 +259,10 @@ class PostgresStatementSamples(object):
             return False
         return True
 
-    def _run_explain(self, statement, obfuscated_statement):
+    def _run_explain(self, db, statement, obfuscated_statement):
         if not self._can_explain_statement(obfuscated_statement):
             return None
-        with self._get_db().cursor() as cursor:
+        with db.cursor() as cursor:
             try:
                 start_time = time.time()
                 self._log.debug("Running query: %s(%s)", self._explain_function, obfuscated_statement)
@@ -287,7 +294,7 @@ class PostgresStatementSamples(object):
             return None
         return result[0][0]
 
-    def _collect_plan_for_statement(self, row):
+    def _collect_plan_for_statement(self, db, row):
         try:
             obfuscated_statement = datadog_agent.obfuscate_sql(row['query'])
         except Exception as e:
@@ -306,7 +313,7 @@ class PostgresStatementSamples(object):
         # - `plan_signature` - hash computed from the normalized JSON plan to group identical plan trees
         # - `resource_hash` - hash computed off the raw sql text to match apm resources
         # - `query_signature` - hash computed from the raw sql text to match query metrics
-        plan_dict = self._run_explain(row['query'], obfuscated_statement)
+        plan_dict = self._run_explain(db, row['query'], obfuscated_statement)
         plan, normalized_plan, obfuscated_plan, plan_signature, plan_cost = None, None, None, None, None
         if plan_dict:
             plan = json.dumps(plan_dict)
@@ -358,15 +365,23 @@ class PostgresStatementSamples(object):
             return event
 
     def _explain_pg_stat_activity(self, rows):
-        for row in rows:
+        keyfunc = lambda r: r['datname']
+        for dbname, rowgroup in itertools.groupby(sorted(rows, key=keyfunc), key=keyfunc):
             try:
-                event = self._collect_plan_for_statement(row)
-                if event:
-                    yield event
-            except Exception:
-                self._log.exception("Crashed trying to collect execution plan for statement")
-                self._check.count(
-                    "dd.postgres.statement_samples.error",
-                    1,
-                    tags=self._tags + ["error:collect-plan-for-statement-crash"],
-                )
+                db = self._get_db(dbname)
+            except Exception as e:
+                self._log.warning("Cannot collect execution plans from database '%s' due to failed connection: %s", dbname, e)
+                continue
+
+            for row in rowgroup:
+                try:
+                    event = self._collect_plan_for_statement(db, row)
+                    if event:
+                        yield event
+                except Exception:
+                    self._log.exception("Crashed trying to collect execution plan for statement in dbname=%s", dbname)
+                    self._check.count(
+                        "dd.postgres.statement_samples.error",
+                        1,
+                        tags=self._tags + ["error:collect-plan-for-statement-crash"],
+                    )

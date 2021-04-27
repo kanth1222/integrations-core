@@ -365,7 +365,7 @@ def test_statement_samples_collection_loop_cancel(aggregator, integration_check,
     # wait for it to stop and make sure it doesn't throw any exceptions
     check.statement_samples._collection_loop_future.result()
     assert not check.statement_samples._collection_loop_future.running(), "thread should be stopped"
-    assert check.statement_samples._db is None, "db connection should be gone"
+    assert check.statement_samples._db_pool[dbm_instance['dbname']] is None, "db connection should be gone"
     aggregator.assert_metric("dd.postgres.statement_samples.collection_loop_cancel")
 
 
